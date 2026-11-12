@@ -44,6 +44,12 @@ is offered only with it, for example `claude/claude-opus-5-5-1m`.
 
 - `maki auth logout claude` removes the stored tokens.
 - maki's own usage display shows the subscription quota.
+- The top border of the input box shows the last turn's speed and the usage
+  left on each plan limit, for example
+  `38 tok/s · weekly 45% left · Fable 0% left until Tue 16:00`. The speed is
+  the turn's output tokens over the time the model spent, without tool calls
+  and permission prompts. The usage refreshes when maki starts and after each
+  turn.
 - When a plan limit is used up, the request stops with a message that names the
   limit, when it resets, and whether other models or extra usage can still run.
   maki retries a rate limit only when no limit is used up.
@@ -52,7 +58,9 @@ is offered only with it, for example `claude/claude-opus-5-5-1m`.
 
 The package requests exactly what it calls: `net` for the API, the model list, the usage
 endpoint, and the token endpoint at `api.anthropic.com`, `run` to detect the system and
-create the login PKCE pair, and `env` to read the `OS` and `CLAUDE_ATIS` variables.
+create the login PKCE pair, `env` to read the `OS` and `CLAUDE_ATIS` variables, and
+`session_read` to time tool calls for the turn speed. maki sends conversation content
+with those events, and the plugin reads none of it.
 
 ## Development
 

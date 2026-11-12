@@ -34,7 +34,7 @@ fn plugin_host() -> PluginHost {
         unsafe { std::env::set_var(var, &dir) };
     }
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-    let mut permissions = PluginPermissions::from_approved(["net", "run", "env"]);
+    let mut permissions = PluginPermissions::from_approved(["net", "run", "env", "session_read"]);
     permissions.set_net_hosts(Some(Arc::from(vec![NET_HOST.to_owned()])));
     host.load_package(
         PLUGIN_NAME,

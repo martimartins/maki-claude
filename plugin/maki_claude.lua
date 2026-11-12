@@ -52,6 +52,12 @@ local RATE_LIMITED = 429
 local OUT_OF_USAGE = 402
 local USED_UP = 100
 local RESET_FORMAT = "%a %d %b %H:%M"
+local SHORT_RESET_FORMAT = "%a %H:%M"
+-- A limit with less than this percent left shows as a warning on the hint line.
+local LOW_LEFT = 20
+local SEPARATOR = " · "
+-- A turn where the model spent less time than this gives no speed worth showing.
+local MIN_MODEL_S = 1
 -- Claude Code sends this when the install is enrolled in a server-side
 -- experiment. Override with CLAUDE_ATIS, or set it to "off" to omit the header.
 local ATIS_DEFAULT = "d5ce23808f17634f"
@@ -164,6 +170,15 @@ local function parse_code(input)
   return code, state
 end
 
+local function auth_headers(access)
+  local headers = { authorization = "Bearer " .. access }
+  local atis = maki.uv.os_getenv("CLAUDE_ATIS") or ATIS_DEFAULT
+  if atis ~= "" and atis ~= "off" then
+    headers["x-cc-atis"] = atis
+  end
+  return headers
+end
+
 local function auth(ctx, purpose)
   local creds = maki.provider.auth.get(ctx.slug)
   if not creds then
@@ -179,12 +194,7 @@ local function auth(ctx, purpose)
       return nil, err
     end
   end
-  local headers = { authorization = "Bearer " .. creds.access }
-  local atis = maki.uv.os_getenv("CLAUDE_ATIS") or ATIS_DEFAULT
-  if atis ~= "" and atis ~= "off" then
-    headers["x-cc-atis"] = atis
-  end
-  return { headers = headers }
+  return { headers = auth_headers(creds.access) }
 end
 
 -- The models the subscription serves. Like Claude Code, a model with a 1M
@@ -215,7 +225,8 @@ local function list_models(ctx)
   return rows
 end
 
--- Unix time of an RFC 3339 stamp. Luau reads an os.time table as UTC.
+-- Unix time of an RFC 3339 stamp, to the nearest minute: the reset Anthropic
+-- reports drifts by fractions of a second. Luau reads an os.time table as UTC.
 local function parse_time(stamp)
   local year, month, day, hour, min, sec = stamp:match("^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
   local time = year
@@ -232,7 +243,8 @@ local function parse_time(stamp)
   end
   local sign, offset_hour, offset_min = stamp:match("([+-])(%d%d):?(%d%d)$")
   local offset = sign and (tonumber(offset_hour) * 3600 + tonumber(offset_min) * 60) or 0
-  return sign == "-" and time + offset or time - offset
+  local utc = (sign == "-" and time + offset or time - offset) + 30
+  return utc - utc % 60
 end
 
 -- Whether a limit on {model}, such as "Fable", covers the focused session's
@@ -246,28 +258,52 @@ local function covers_focused(model)
   return id:find((model:lower():gsub("%W", "")), 1, true) ~= nil
 end
 
--- What a 429 means when a plan limit that covers the request is used up, from
--- /api/oauth/usage. Without one it is a passing rate limit, which maki retries.
-local function usage_message(usage)
-  local used_up, every_model, weekly = {}, false, nil
+-- What /api/oauth/usage reports for the account the {headers} log in as.
+local function get_usage(headers)
+  local merged = { ["anthropic-version"] = API_VERSION, ["anthropic-beta"] = OAUTH_BETA }
+  for name, value in pairs(headers) do
+    merged[name] = value
+  end
+  local usage = request(USAGE_URL, { headers = merged })
+  return type(usage) == "table" and usage or nil
+end
+
+-- The plan limits in a usage answer, each with its period ("5-hour", "weekly"),
+-- the model it is scoped to, if any, and its reset as Unix time.
+local function plan_limits(usage)
+  local limits = {}
   for _, limit in ipairs(type(usage.limits) == "table" and usage.limits or {}) do
     local scope = type(limit.scope) == "table" and limit.scope.model
-    local model = type(scope) == "table" and type(scope.display_name) == "string" and scope.display_name or nil
-    local percent = type(limit.percent) == "number" and limit.percent or 0
-    if percent >= USED_UP and (not model or covers_focused(model)) then
-      local period = limit.kind == "session" and "5-hour" or (type(limit.group) == "string" and limit.group or "plan")
-      local reset = type(limit.resets_at) == "string" and parse_time(limit.resets_at)
+    if type(limit.percent) == "number" then
+      table.insert(limits, {
+        kind = limit.kind,
+        period = limit.kind == "session" and "5-hour" or (type(limit.group) == "string" and limit.group or "plan"),
+        model = type(scope) == "table" and type(scope.display_name) == "string" and scope.display_name or nil,
+        percent = limit.percent,
+        reset = type(limit.resets_at) == "string" and parse_time(limit.resets_at) or nil,
+      })
+    end
+  end
+  return limits
+end
+
+-- What a 429 means when a plan limit that covers the request is used up.
+-- Without one it is a passing rate limit, which maki retries.
+local function usage_message(usage)
+  local used_up, every_model, weekly = {}, false, nil
+  for _, limit in ipairs(plan_limits(usage)) do
+    if limit.percent >= USED_UP and (not limit.model or covers_focused(limit.model)) then
       table.insert(
         used_up,
         ("the %s%s limit is used up%s"):format(
-          period,
-          model and (" " .. model) or "",
-          reset and (" until " .. os.date(RESET_FORMAT, reset)) or ""
+          limit.period,
+          limit.model and (" " .. limit.model) or "",
+          limit.reset and (" until " .. os.date(RESET_FORMAT, limit.reset)) or ""
         )
       )
-      every_model = every_model or not model
+      every_model = every_model or not limit.model
     elseif limit.kind == "weekly_all" then
-      weekly = percent
+      weekly = limit.percent
     end
   end
   if #used_up == 0 then
@@ -288,19 +324,106 @@ local function usage_message(usage)
   return table.concat(parts, " ")
 end
 
+-- The usage left on each plan limit, as spans for the hint line.
+local function usage_spans(usage)
+  local spans = {}
+  for _, limit in ipairs(plan_limits(usage)) do
+    local left = math.max(0, math.floor(100 - limit.percent + 0.5))
+    local text = ("%s %d%% left"):format(limit.model or limit.period, left)
+    if limit.percent >= USED_UP then
+      local reset = limit.reset and (" until " .. os.date(SHORT_RESET_FORMAT, limit.reset)) or ""
+      table.insert(spans, { text .. reset, "error" })
+    else
+      table.insert(spans, { text, left < LOW_LEFT and "warning" or "dim" })
+    end
+  end
+  return spans
+end
+
+-- What the hint line shows: the last turn's speed and the usage left.
+local readout = { usage = {} }
+
+local function render_readout()
+  local spans = {}
+  if readout.speed then
+    table.insert(spans, { ("%d tok/s"):format(math.floor(readout.speed + 0.5)), "accent" })
+  end
+  for _, span in ipairs(readout.usage) do
+    if #spans > 0 then
+      table.insert(spans, { SEPARATOR, "dim" })
+    end
+    table.insert(spans, span)
+  end
+  maki.ui.set_status_hint(#spans > 0 and spans or nil)
+end
+
+-- Uses the stored token as it is. Refreshing it is the auth hook's job, and two
+-- refreshes would race for the one refresh token.
+local function refresh_usage()
+  maki.async.spawn(function()
+    if not maki.session.live() then
+      return
+    end
+    local creds = maki.provider.auth.get(SLUG)
+    if not creds then
+      readout.usage = {}
+    elseif creds.expires > os.time() then
+      local usage = get_usage(auth_headers(creds.access))
+      readout.usage = usage and usage_spans(usage) or readout.usage
+    end
+    render_readout()
+  end)
+end
+
 -- A used-up plan limit does not pass before it resets, so its 429 becomes a 402
 -- that says which limit and when. Every other error stays as it is.
 local function map_error(ctx, status)
   if status ~= RATE_LIMITED then
     return nil
   end
-  local headers = { ["anthropic-version"] = API_VERSION, ["anthropic-beta"] = OAUTH_BETA }
-  for name, value in pairs(ctx.headers) do
-    headers[name] = value
+  local usage = get_usage(ctx.headers)
+  if not usage then
+    return nil
   end
-  local usage = request(USAGE_URL, { headers = headers })
-  local message = type(usage) == "table" and usage_message(usage)
+  readout.usage = usage_spans(usage)
+  render_readout()
+  local message = usage_message(usage)
   return message and { status = OUT_OF_USAGE, message = message } or nil
+end
+
+-- Each session's running turn: when it started, and how long tool calls and
+-- permission prompts held it, with overlaps counted once.
+local turns = {}
+
+local function hold(session, on)
+  local turn = turns[session]
+  if not turn then
+    return
+  end
+  if on then
+    if turn.holds == 0 then
+      turn.since = os.clock()
+    end
+    turn.holds = turn.holds + 1
+  elseif turn.holds > 0 then
+    turn.holds = turn.holds - 1
+    if turn.holds == 0 then
+      turn.held = turn.held + os.clock() - turn.since
+    end
+  end
+end
+
+-- Output tokens over the time the model spent on the turn. In Luau, os.clock is
+-- a monotonic wall clock, not processor time.
+local function turn_speed(turn, usage)
+  local now = os.clock()
+  local held = turn.held + (turn.holds > 0 and now - turn.since or 0)
+  local seconds = now - turn.start - held
+  local output = type(usage) == "table" and usage.output_tokens
+  if type(output) == "number" and output > 0 and seconds >= MIN_MODEL_S then
+    return output / seconds
+  end
+  return nil
 end
 
 local function login(ctx)
@@ -363,3 +486,44 @@ maki.provider.register({
   login = login,
   logout = logout,
 })
+
+maki.api.create_autocmd("TurnStart", {
+  callback = function(ev)
+    turns[ev.data.session_id] = { start = os.clock(), held = 0, holds = 0, waiting = false }
+  end,
+})
+
+maki.api.create_autocmd("ToolStart", {
+  callback = function(ev)
+    hold(ev.data.session_id, true)
+  end,
+})
+
+maki.api.create_autocmd("ToolDone", {
+  callback = function(ev)
+    hold(ev.data.session_id, false)
+  end,
+})
+
+maki.api.create_autocmd("SessionStatusChanged", {
+  callback = function(ev)
+    local turn = turns[ev.data.session_id]
+    local waiting = ev.data.status == "needs_input"
+    if turn and turn.waiting ~= waiting then
+      turn.waiting = waiting
+      hold(ev.data.session_id, waiting)
+    end
+  end,
+})
+
+maki.api.create_autocmd("TurnEnd", {
+  callback = function(ev)
+    local turn = turns[ev.data.session_id]
+    turns[ev.data.session_id] = nil
+    readout.speed = turn and turn_speed(turn, ev.data.usage) or readout.speed
+    render_readout()
+    refresh_usage()
+  end,
+})
+
+maki.api.create_autocmd("SessionFocusChanged", { once = true, callback = refresh_usage })

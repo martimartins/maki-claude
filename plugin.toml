@@ -3,9 +3,12 @@ providers = ["claude"]
 
 # net reaches the API, the model list, the usage endpoint and the token
 # endpoint, run detects the system and creates the login PKCE pair, env reads OS
-# and the CLAUDE_ATIS override.
+# and the CLAUDE_ATIS override. session_read lets the turn speed time tool calls
+# from TurnStart and ToolDone, which carry conversation content; the plugin
+# reads none of it.
 [permissions]
 net = true
 run = true
 env = true
+session_read = true
 net_hosts = ["api.anthropic.com"]

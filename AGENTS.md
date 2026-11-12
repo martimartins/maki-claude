@@ -5,7 +5,10 @@ through the maki pack system, not as a builtin. One file does the work:
   `list_models`, `map_error`, `login` and `logout` hooks. On a 429,
   `map_error` reads `/api/oauth/usage`, and when a plan limit that covers the
   request is used up it returns a 402 naming the limit and its reset, which
-  maki shows instead of retrying. It uses the `anthropic` codec, so
+  maki shows instead of retrying. Autocmds time each turn, leaving out tool
+  calls and permission prompts, and put the last turn's speed and the usage
+  left on maki's hint line with `maki.ui.set_status_hint`. It uses the
+  `anthropic` codec, so
   the wire format is maki's. `list_models` reads the models the subscription
   serves from `/v1/models` and, like Claude Code, offers a model with a 1M
   window only under its `-1m` id, which makes maki send the long context beta. It declares the Claude Code identity line as
@@ -16,8 +19,8 @@ through the maki pack system, not as a builtin. One file does the work:
 Login is the Claude Code OAuth flow with the hosted callback page: the browser
 shows a code and the user pastes it. A Lua hook cannot listen on a port, so
 there is no loopback callback. maki stores the tokens through
-`maki.provider.auth`. Keep the plugin to the provider: no commands, no files of
-its own.
+`maki.provider.auth`. Keep the plugin to the provider and its hint line: no
+commands, no files of its own.
 
 ## Code guidelines
 
