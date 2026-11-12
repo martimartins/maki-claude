@@ -17,6 +17,7 @@ const ACCESS: &str = "access-token";
 const FAR_FUTURE_S: u64 = 4102444800;
 const LOGIN_HINT: &str = "maki auth login claude";
 const BROKEN_HOOK: &str = "hook failed";
+const SUPPORTED_SYSTEMS: &str = "Windows, Linux and macOS";
 
 /// The provider registry and the environment are global, so every test leans
 /// on nextest running it in a process of its own.
@@ -44,6 +45,16 @@ fn plugin_host() -> PluginHost {
     .unwrap();
     plugin::commit_load();
     host
+}
+
+/// What the `auth` hook answers when nothing is stored.
+fn auth_error_without_a_login() -> String {
+    let _host = plugin_host();
+    let failure = match plugin::create(SLUG, Timeouts::default()) {
+        Ok(provider) => runtime().block_on(provider.reload_auth()).unwrap_err(),
+        Err(err) => err,
+    };
+    failure.to_string()
 }
 
 #[test]
@@ -78,12 +89,26 @@ fn a_stored_token_becomes_the_bearer_header() {
 
 #[test]
 fn auth_without_a_login_names_the_login_command() {
-    let _host = plugin_host();
-    let failure = match plugin::create(SLUG, Timeouts::default()) {
-        Ok(provider) => runtime().block_on(provider.reload_auth()).unwrap_err(),
-        Err(err) => err,
-    };
-    let message = failure.to_string();
+    let message = auth_error_without_a_login();
     assert!(message.contains(LOGIN_HINT), "{message}");
+    assert!(!message.contains(BROKEN_HOOK), "{message}");
+}
+
+#[cfg(unix)]
+#[test]
+fn auth_without_a_login_on_another_system_names_the_supported_ones() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = std::env::temp_dir().join(format!("maki-claude-bin-{}", std::process::id()));
+    std::fs::create_dir_all(&bin).unwrap();
+    let uname = bin.join("uname");
+    std::fs::write(&uname, "#!/bin/sh\necho FreeBSD\n").unwrap();
+    std::fs::set_permissions(uname, std::fs::Permissions::from_mode(0o755)).unwrap();
+    unsafe {
+        std::env::remove_var("OS");
+        std::env::set_var("PATH", bin);
+    }
+    let message = auth_error_without_a_login();
+    assert!(message.contains(SUPPORTED_SYSTEMS), "{message}");
     assert!(!message.contains(BROKEN_HOOK), "{message}");
 }

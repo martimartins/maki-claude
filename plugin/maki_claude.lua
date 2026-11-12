@@ -20,9 +20,26 @@ local LONG_CONTEXT = 1000000
 local LONG_CONTEXT_SUFFIX = "-1m"
 local REFRESH_MARGIN_S = 300
 local PKCE_WAIT_MS = 10000
+local OS_WAIT_MS = 5000
 -- Prints a random verifier, then its S256 challenge in standard base64.
 local PKCE_SCRIPT =
   'v=$(openssl rand -hex 32) && echo "$v" && printf %s "$v" | openssl dgst -sha256 -binary | openssl base64 -A'
+-- The same pair from the .NET classes that ship with Windows PowerShell.
+local PKCE_POWERSHELL = [[
+$ErrorActionPreference = 'Stop'
+$bytes = New-Object byte[] 32
+[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+$verifier = [BitConverter]::ToString($bytes).Replace('-', '').ToLowerInvariant()
+$digest = [Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::ASCII.GetBytes($verifier))
+[Console]::WriteLine($verifier)
+[Console]::WriteLine([Convert]::ToBase64String($digest))
+]]
+local PKCE_COMMANDS = {
+  windows = { "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", PKCE_POWERSHELL },
+  linux = { "sh", "-c", PKCE_SCRIPT },
+  macos = { "sh", "-c", PKCE_SCRIPT },
+}
+local UNSUPPORTED_OS = "Claude login runs on Windows, Linux and macOS, not on %s"
 local NOT_LOGGED_IN = "not logged in to Claude: run `maki auth login claude`"
 -- maki replaces the message of a 401 with its own generic login hint.
 local NEEDS_LOGIN = 403
@@ -54,17 +71,60 @@ local function urlencode(value)
   end))
 end
 
-local function pkce()
-  local job, err = maki.fn.jobstart({ "sh", "-c", PKCE_SCRIPT }, { scope = "plugin" })
+-- The output of a command that exits 0, or why there is none.
+local function run(command, timeout_ms)
+  local job, err = maki.fn.jobstart(command, { scope = "plugin" })
   if not job then
-    return nil, "cannot run openssl: " .. tostring(err)
+    return nil, err
   end
-  local result = maki.fn.jobwait(job, PKCE_WAIT_MS)
-  local verifier, challenge = ((result and result.stdout) or ""):match("^(%x+)\n(%S+)")
+  local result, wait_err = maki.fn.jobwait(job, timeout_ms)
+  if not result then
+    maki.fn.jobstop(job)
+    return nil, wait_err
+  end
+  if result.exit_code ~= 0 then
+    return nil, result.stderr:match("%S[^\r\n]*") or ("exit code " .. tostring(result.exit_code))
+  end
+  return result.stdout
+end
+
+-- "windows", "linux", "macos", or what uname calls any other system, in lower case.
+local function detect_os()
+  if maki.uv.os_getenv("OS") == "Windows_NT" then
+    return "windows"
+  end
+  local output, err = run({ "uname", "-s" }, OS_WAIT_MS)
+  local name = output and output:match("%S+")
+  if not name then
+    return nil, "cannot detect the operating system with uname: " .. tostring(err or "no output")
+  end
+  return name == "Darwin" and "macos" or name:lower()
+end
+
+-- The command that prints a PKCE pair on this system, or why login cannot run here.
+local function pkce_command()
+  local os_name, err = detect_os()
+  if not os_name then
+    return nil, err
+  end
+  local command = PKCE_COMMANDS[os_name]
+  if not command then
+    return nil, UNSUPPORTED_OS:format(os_name)
+  end
+  return command
+end
+
+local function pkce()
+  local command, err = pkce_command()
+  if not command then
+    return nil, err
+  end
+  local output, run_err = run(command, PKCE_WAIT_MS)
+  local verifier, challenge = (output or ""):match("^(%x+)\r?\n(%S+)")
   if not verifier then
-    return nil, "openssl did not produce a PKCE pair, is it installed?"
+    return nil, "cannot create a PKCE pair with " .. command[1] .. ": " .. tostring(run_err or "unexpected output")
   end
-  return verifier, (challenge:gsub("+", "-"):gsub("/", "_"):gsub("=", ""))
+  return verifier, (challenge:gsub("%+", "-"):gsub("/", "_"):gsub("=", ""))
 end
 
 -- Posts to the token endpoint and stores what it grants.
@@ -99,7 +159,9 @@ end
 local function auth(ctx, purpose)
   local creds = maki.provider.auth.get(ctx.slug)
   if not creds then
-    return fail(NEEDS_LOGIN, NOT_LOGGED_IN)
+    -- Where login cannot run, say why instead of sending the user to it.
+    local command, err = pkce_command()
+    return fail(NEEDS_LOGIN, command and NOT_LOGGED_IN or err)
   end
   if purpose == "refresh" or (purpose == "resolve" and creds.expires <= os.time() + REFRESH_MARGIN_S) then
     local err

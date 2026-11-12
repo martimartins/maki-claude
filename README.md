@@ -9,9 +9,10 @@ provider's system prefix; nothing else about the request has to change.
 ## Requirements
 
 - maki 0.7.0 or newer
-- `openssl` on `PATH`, used once per login
+- On Linux and macOS, `uname`, `sh` and `openssl` on `PATH`, used to log in
+- On Windows, Windows PowerShell (`powershell.exe`) on `PATH`, used to log in
 - A Claude Pro or Max subscription
-- Linux or macOS
+- Windows, Linux or macOS
 
 ## Install
 
@@ -30,8 +31,12 @@ maki auth login claude
 ```
 
 Login opens the browser. Approve the request, copy the code the page shows,
-and paste it into the terminal. maki stores the tokens in its state directory
-with mode 0600 and the plugin refreshes them on its own.
+and paste it into the terminal. maki stores the tokens in its state directory,
+with mode 0600 on Linux and macOS, and the plugin refreshes them on its own.
+
+On any other system, login stops with a message that names the supported
+systems, and maki shows the same message when you use a Claude model before
+you log in. A missing tool stops the login with a message that names it.
 
 Pick a model with `/model`. The list comes from your subscription at runtime,
 under the `claude/` prefix. Like Claude Code, a model with a 1M context window
@@ -43,8 +48,8 @@ is offered only with it, for example `claude/claude-opus-5-5-1m`.
 ## Permissions
 
 The package requests exactly what it calls: `net` for the API, the model list, and the
-token endpoint at `api.anthropic.com`, and `run` to call `openssl` for the login PKCE
-pair.
+token endpoint at `api.anthropic.com`, `run` to detect the system and create the login
+PKCE pair, and `env` to read the `OS` and `CLAUDE_ATIS` variables.
 
 ## Development
 
