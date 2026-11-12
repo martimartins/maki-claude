@@ -2,7 +2,10 @@ maki-claude puts a Claude subscription behind a maki plugin provider. It loads
 through the maki pack system, not as a builtin. One file does the work:
 
 - `plugin/maki_claude.lua`: one `maki.provider.register` call with `auth`,
-  `list_models`, `login` and `logout` hooks. It uses the `anthropic` codec, so
+  `list_models`, `map_error`, `login` and `logout` hooks. On a 429,
+  `map_error` reads `/api/oauth/usage`, and when a plan limit that covers the
+  request is used up it returns a 402 naming the limit and its reset, which
+  maki shows instead of retrying. It uses the `anthropic` codec, so
   the wire format is maki's. `list_models` reads the models the subscription
   serves from `/v1/models` and, like Claude Code, offers a model with a 1M
   window only under its `-1m` id, which makes maki send the long context beta. It declares the Claude Code identity line as

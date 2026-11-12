@@ -12,7 +12,9 @@ local API_URL = "https://api.anthropic.com"
 -- the token endpoint answers with a 429.
 local TOKEN_URL = API_URL .. "/v1/oauth/token"
 local MODELS_URL = API_URL .. "/v1/models?limit=1000"
+local USAGE_URL = API_URL .. "/api/oauth/usage"
 local API_VERSION = "2023-06-01"
+local OAUTH_BETA = "oauth-2025-04-20"
 local REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
 local SCOPES =
   "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
@@ -44,6 +46,12 @@ local NOT_LOGGED_IN = "not logged in to Claude: run `maki auth login claude`"
 -- maki replaces the message of a 401 with its own generic login hint.
 local NEEDS_LOGIN = 403
 local UNREACHABLE = 503
+local RATE_LIMITED = 429
+-- maki shows the message of a 402 and does not retry it, as with its own
+-- billing errors.
+local OUT_OF_USAGE = 402
+local USED_UP = 100
+local RESET_FORMAT = "%a %d %b %H:%M"
 -- Claude Code sends this when the install is enrolled in a server-side
 -- experiment. Override with CLAUDE_ATIS, or set it to "off" to omit the header.
 local ATIS_DEFAULT = "d5ce23808f17634f"
@@ -207,6 +215,94 @@ local function list_models(ctx)
   return rows
 end
 
+-- Unix time of an RFC 3339 stamp. Luau reads an os.time table as UTC.
+local function parse_time(stamp)
+  local year, month, day, hour, min, sec = stamp:match("^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
+  local time = year
+    and os.time({
+      year = tonumber(year),
+      month = tonumber(month),
+      day = tonumber(day),
+      hour = tonumber(hour),
+      min = tonumber(min),
+      sec = tonumber(sec),
+    })
+  if not time then
+    return nil
+  end
+  local sign, offset_hour, offset_min = stamp:match("([+-])(%d%d):?(%d%d)$")
+  local offset = sign and (tonumber(offset_hour) * 3600 + tonumber(offset_min) * 60) or 0
+  return sign == "-" and time + offset or time - offset
+end
+
+-- Whether a limit on {model}, such as "Fable", covers the focused session's
+-- model. Without a UI the session is unknown, so the limit counts.
+local function covers_focused(model)
+  local focused = maki.model.get()
+  if type(focused) ~= "table" or focused.provider ~= SLUG or type(focused.id) ~= "string" then
+    return true
+  end
+  local id = focused.id:lower():gsub("%W", "")
+  return id:find((model:lower():gsub("%W", "")), 1, true) ~= nil
+end
+
+-- What a 429 means when a plan limit that covers the request is used up, from
+-- /api/oauth/usage. Without one it is a passing rate limit, which maki retries.
+local function usage_message(usage)
+  local used_up, every_model, weekly = {}, false, nil
+  for _, limit in ipairs(type(usage.limits) == "table" and usage.limits or {}) do
+    local scope = type(limit.scope) == "table" and limit.scope.model
+    local model = type(scope) == "table" and type(scope.display_name) == "string" and scope.display_name or nil
+    local percent = type(limit.percent) == "number" and limit.percent or 0
+    if percent >= USED_UP and (not model or covers_focused(model)) then
+      local period = limit.kind == "session" and "5-hour" or (type(limit.group) == "string" and limit.group or "plan")
+      local reset = type(limit.resets_at) == "string" and parse_time(limit.resets_at)
+      table.insert(
+        used_up,
+        ("the %s%s limit is used up%s"):format(
+          period,
+          model and (" " .. model) or "",
+          reset and (" until " .. os.date(RESET_FORMAT, reset)) or ""
+        )
+      )
+      every_model = every_model or not model
+    elseif limit.kind == "weekly_all" then
+      weekly = percent
+    end
+  end
+  if #used_up == 0 then
+    return nil
+  end
+  local parts = { "Claude usage limit reached: " .. table.concat(used_up, " and ") .. "." }
+  if weekly and not every_model then
+    table.insert(
+      parts,
+      ("The weekly limit for all models is at %d%%, so other models still work: pick one with /model."):format(weekly)
+    )
+  end
+  local extra = usage.extra_usage
+  if type(extra) == "table" and extra.is_enabled == false then
+    local reason = type(extra.disabled_reason) == "string" and (": " .. extra.disabled_reason:gsub("_", " ")) or ""
+    table.insert(parts, "Extra usage is off" .. reason .. ".")
+  end
+  return table.concat(parts, " ")
+end
+
+-- A used-up plan limit does not pass before it resets, so its 429 becomes a 402
+-- that says which limit and when. Every other error stays as it is.
+local function map_error(ctx, status)
+  if status ~= RATE_LIMITED then
+    return nil
+  end
+  local headers = { ["anthropic-version"] = API_VERSION, ["anthropic-beta"] = OAUTH_BETA }
+  for name, value in pairs(ctx.headers) do
+    headers[name] = value
+  end
+  local usage = request(USAGE_URL, { headers = headers })
+  local message = type(usage) == "table" and usage_message(usage)
+  return message and { status = OUT_OF_USAGE, message = message } or nil
+end
+
 local function login(ctx)
   local verifier, challenge = pkce()
   if not verifier then
@@ -263,6 +359,7 @@ maki.provider.register({
   system_prefix = IDENTITY,
   auth = auth,
   list_models = list_models,
+  map_error = map_error,
   login = login,
   logout = logout,
 })

@@ -44,12 +44,15 @@ is offered only with it, for example `claude/claude-opus-5-5-1m`.
 
 - `maki auth logout claude` removes the stored tokens.
 - maki's own usage display shows the subscription quota.
+- When a plan limit is used up, the request stops with a message that names the
+  limit, when it resets, and whether other models or extra usage can still run.
+  maki retries a rate limit only when no limit is used up.
 
 ## Permissions
 
-The package requests exactly what it calls: `net` for the API, the model list, and the
-token endpoint at `api.anthropic.com`, `run` to detect the system and create the login
-PKCE pair, and `env` to read the `OS` and `CLAUDE_ATIS` variables.
+The package requests exactly what it calls: `net` for the API, the model list, the usage
+endpoint, and the token endpoint at `api.anthropic.com`, `run` to detect the system and
+create the login PKCE pair, and `env` to read the `OS` and `CLAUDE_ATIS` variables.
 
 ## Development
 
